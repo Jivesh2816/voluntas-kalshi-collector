@@ -1,1 +1,10 @@
 /target/
+
+# Credentials: never commit API keys or private keys.
+.env
+*.pem
+*.key
+secrets/
+
+# Collector output.
+*.sbe

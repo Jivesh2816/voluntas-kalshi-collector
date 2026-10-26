@@ -6,10 +6,22 @@ build = "src/util/build.rs"
 
 [dependencies]
 anyhow = "1"
+base64 = "0.23.1"
 chrono = "0.4"
+clap = { version = "4.6.7", features = ["derive", "env"] }
 crossbeam = "0.8.4"
+futures-util = { version = "0.3.34", default-features = false, features = ["async-await-macro", "sink", "std"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "json", "query"] }
+ring = "0.17.14"
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1.0.154"
 tempfile = "3"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "signal", "time", "sync", "net"] }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+tokio-util = "0.7.20"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [build-dependencies]
 ergo-sbe = "=0.1.16"
