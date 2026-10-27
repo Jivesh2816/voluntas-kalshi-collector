@@ -7,6 +7,25 @@ FIX SBE file. It uses the template's schema and `AlignedSbeWriter`
 unchanged. SIGINT (or SIGTERM) closes the WebSockets and flushes and closes
 the file.
 
+## Status
+
+- **Validated live** against production Kalshi with an authenticated key, at
+  up to **3,000 markets on 6 WebSocket connections**. All of these were zero:
+  sequence gaps, crossed books, invalid books and command errors. Books rebuilt
+  from the output file matched Kalshi's REST order book exactly for all 200
+  markets sampled in flight while the network kept up. In the
+  network-limited capacity run, 54 of 59 matched; the other 5 were behind
+  because of receive lag.
+  See [What has and has not been verified live](#what-has-and-has-not-been-verified-live).
+- **Full-market scale (~147k markets) was not validated.** It fits Kalshi's
+  documented limits on paper. But in testing, high-volume collection was
+  limited by **local network throughput**: the test host's link measured
+  0.5–1.2 MB/s. At about 1,300 deltas/s, receive lag grew until Kalshi reset
+  the connection. The collector recovered automatically and was not the
+  bottleneck (see the throughput findings below). A full-scale run needs a
+  host with more bandwidth, or WebSocket compression (not implemented).
+- The optional extensions are not implemented.
+
 - [Setup](#setup)
 - [Running](#running)
 - [Architecture](#architecture)
@@ -42,25 +61,35 @@ uses the public REST API and needs no key.
    (<https://kalshi.com/account/profile>), and click **Create New API Key**.
    Ed25519 is the default and is supported, and so is RSA. If you're offered
    permission scopes, read-only is enough.
-2. Kalshi shows the private key once and downloads it as a file. Move it
-   somewhere outside the repository and restrict it:
+2. Kalshi shows the private key once and downloads it as a file. Move it into
+   your Linux home directory, outside the repository, readable only by you.
+   Replace `<path-to-downloaded-key>` with the real path. On WSL, Windows
+   downloads are under `/mnt/c/Users/<windows-user>/Downloads/`.
 
    ```bash
-   mkdir -p ~/.kalshi && mv ~/Downloads/<key-file> ~/.kalshi/kalshi-key.pem
-   chmod 600 ~/.kalshi/kalshi-key.pem
+   install -d -m 700 ~/.kalshi
+   install -m 600 "<path-to-downloaded-key>" ~/.kalshi/kalshi-key.pem
+   rm "<path-to-downloaded-key>"
    ```
 
+   On WSL, keep the key under `~`, not under `/mnt/c`: Linux file permissions
+   aren't enforced on Windows drives.
 3. Give the collector the key ID and the key file path through environment
    variables. The private key itself never goes into an environment variable,
-   a command line, or the repository:
+   a command line, or the repository. A file outside the repository keeps them
+   out of shell history:
 
    ```bash
+   cat > ~/.kalshi/env <<'EOF'
    export KALSHI_API_KEY_ID=<key id shown by Kalshi>
    export KALSHI_PRIVATE_KEY_PATH=$HOME/.kalshi/kalshi-key.pem
+   EOF
+   chmod 600 ~/.kalshi/env
+   source ~/.kalshi/env   # in each shell before running the collector
    ```
 
-   You can also put those two lines in a `.env` file in the repository root,
-   which is gitignored, and load it with `set -a; source .env; set +a`.
+   `.env`, `*.pem`, `*.key` and `secrets/` are gitignored in case you keep
+   credentials near the repository anyway.
 
 The collector logs only the key ID and the key type, never key material.
 
@@ -70,8 +99,12 @@ The collector logs only the key ID and the key type, never key material.
 # Smoke test: 50 markets, 2 minutes, then Ctrl-C.
 cargo run --release -- --output smoke.sbe --max-markets 50
 
-# Everything (≈150k markets on 26 Oct 2026).
+# Everything (≈150k markets on 26 Oct 2026). Not validated at this scale;
+# needs a high-bandwidth host (see Status).
 cargo run --release -- --output kalshi.sbe
+
+# Validated configuration: 3,000 markets on 6 connections.
+cargo run --release -- --output kalshi.sbe --max-markets 3000 --markets-per-connection 500
 ```
 
 Press Ctrl-C once for a graceful shutdown: every WebSocket gets a Close frame
@@ -91,9 +124,24 @@ pass `--overwrite`.
 | `--ws-url`, `--rest-url` | production | Also `KALSHI_WS_URL`, `KALSHI_REST_URL` (demo: `wss://external-api-ws.demo.kalshi.co/trade-api/ws/v2`, `https://external-api.demo.kalshi.co/trade-api/v2`) |
 
 Logs go to stderr. Control verbosity with `RUST_LOG`; for example,
-`RUST_LOG=info,engineering_challenge=debug`. Every minute the collector logs
-the market, connection and book counts plus these counters: sequence gaps,
-reconnects, resyncs, missing exchange timestamps, and crossed books.
+`RUST_LOG=info,engineering_challenge=debug`. Every minute
+(`--stats-interval-secs`) the collector logs:
+
+- market, connection and live-book counts, and the writer's queue backlog;
+- **counters:**
+  - sequence gaps
+  - session failures (reconnects)
+  - resyncs
+  - parse and command errors
+  - missing exchange timestamps
+  - book inconsistencies
+  - crossed books
+  - `exchange_after_receive`, which flags host clock skew
+- **lag gauges** (maximum over the interval):
+  - `max_send_lag_ms`: receive time minus Kalshi's `sending_ts_ms`
+  - `max_change_lag_ms`: receive time minus the delta's `ts_ms`
+
+Shutdown also logs final totals.
 
 ## Architecture
 
@@ -278,7 +326,8 @@ using an authenticated Ed25519 key.
 | Multi-socket | 3,000 / 6 × 500 | 124,982 | all 0 | **150 of 150** match |
 | Capacity | 2,000 / 2 × 1000 | 106,791 | all 0; 1 reconnect (see below) | 54 of 59 match; the 5 others lagged behind (see below) |
 
-- **REST cross-check method.** While the collector runs, a script fetches
+- **REST cross-check method.** While the collector runs, a small ad-hoc
+  Python script (not included in this repository) fetches
   Kalshi's public `GET /markets/{ticker}/orderbook` and records the local
   request time. That endpoint reports No bids in No-leg prices. We then ask
   whether the book rebuilt from our file (with `inspect --history-json`) held
@@ -336,8 +385,10 @@ link carried. Run it from a host with real bandwidth, close to Kalshi
   REST latency we saw.
 - **Paused markets** (`inactive`) are treated as not trading and unsubscribed.
   They're resubscribed, with a fresh snapshot, when they reopen.
-- **Disk usage.** The minute snapshots of ~150k books come to roughly
-  50–100 MB a minute, plus deltas.
+- **Disk usage (estimate).** The minute snapshots of ~150k books should come
+  to roughly 50–100 MB a minute, plus deltas. The release-mode scale test
+  measured about 64 MiB per pass over 150k books of 20 levels each.
+  Full-scale output was not measured.
 - **Clock accuracy.** Local timestamps are only as good as the host clock.
   On the test machine, Windows Time had never synced ("Local CMOS Clock"), and
   WSL inherits that clock. NTP showed it about 684 ms behind, so most deltas
