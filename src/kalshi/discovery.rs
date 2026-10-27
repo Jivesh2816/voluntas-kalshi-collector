@@ -146,6 +146,7 @@ impl Discovery {
                         return;
                     }
                 }
+                Err(_) if self.cancel.is_cancelled() => return,
                 Err(error) => {
                     tracing::warn!(error = %format!("{error:#}"), "full market scan failed");
                     wait = wait.min(Duration::from_secs(30));
@@ -181,6 +182,7 @@ impl Discovery {
                     tracing::debug!(markets = count, "incremental market poll");
                     since = poll_started;
                 }
+                Err(_) if self.cancel.is_cancelled() => return,
                 Err(error) => {
                     tracing::warn!(error = %format!("{error:#}"), "incremental market poll failed");
                 }

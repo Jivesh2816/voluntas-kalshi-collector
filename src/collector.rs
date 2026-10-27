@@ -109,6 +109,10 @@ pub struct Stats {
     pub inconsistencies: u64,
     /// Writes that left the book crossed (best bid >= best ask).
     pub crossed_after_write: u64,
+    /// Deltas whose exchange time is later than their local receive time.
+    /// A message can't arrive before it was sent, so a rising count means the
+    /// local clock is behind the exchange's (check NTP).
+    pub exchange_after_receive: u64,
 }
 
 struct SymbolState {
@@ -238,6 +242,9 @@ impl<S: OrderbookSink> Collector<S> {
                 match live.book.apply_delta(side, price, delta) {
                     Ok(quantity) => {
                         live.exchange_timestamp = exchange_timestamp;
+                        if exchange_timestamp > received_at {
+                            self.stats.exchange_after_receive += 1;
+                        }
                         if live.book.is_crossed() {
                             self.stats.crossed_after_write += 1;
                         }

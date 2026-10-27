@@ -215,6 +215,14 @@ cargo fmt --check && cargo check --all-targets && cargo clippy --all-targets && 
 cargo test --release --test collector_file -- --ignored --nocapture   # 150k-book scale check
 ```
 
+To check a real output file, run `examples/inspect.rs`. It decodes the file
+with the template's `AlignedSbeReader`, replays every book, and reports
+structural checks and receive latency:
+
+```bash
+cargo run --release --example inspect -- kalshi.sbe [--dump-json books.json] [--history-json states.json] [--latency-tsv deltas.tsv]
+```
+
 There are 48 tests, and none of them need credentials or the network:
 
 - **Unit tests (40):**
@@ -249,33 +257,70 @@ There are 48 tests, and none of them need credentials or the network:
 
 ## What has and has not been verified live
 
-**Verified against production Kalshi (26 Oct 2026, no credentials needed):**
-- `GET /markets?status=open&mve_filter=exclude` returned 147,085 markets over
-  148 pages, all `active`, with zero `mve_collection_ticker` or `KXMVE`
-  markets. A full scan took about 3.5–7 minutes.
-- The `min_updated_ts` incremental query returns created, opened, closed,
-  paused and settled markets, and `updated_time` is bumped when a market opens.
-- Unauthenticated WebSocket upgrades to both production hosts return `401`.
-- The binary ran for 75 s against live REST discovery, opened connections as
-  pages arrived, and shut down cleanly on SIGINT. Its WebSockets pointed at a
-  closed local port, since there were no credentials.
+All of these runs were on 26–27 Oct 2026, from a home connection through WSL2,
+using an authenticated Ed25519 key.
 
-**Not verified live (needs an API key), and checked only against the docs and the mock:**
-- The real WebSocket handshake and signature. The signing code follows the
-  documented scheme, and the mock verifies the signature cryptographically.
-- What `use_yes_price: true` actually returns. Watch `crossed_after_write`: a
-  wrong side mapping would show up immediately as crossed books.
-- Whether `ok` replies really consume a `seq` number, as the docs' example
-  shows. If they don't, the `seq_gaps` counter will rise with every subscription change.
-- Whether `add_markets` sends snapshots for the added markets (there's a
-  safety net either way).
-- Kalshi's per-subscription market limit. It isn't documented (error 26), so
-  the default of 1000 per connection is a guess. Lower it if error 26 appears.
-- Behavior at full scale: around 147 connections and around 147k initial snapshots.
+**Discovery (public REST):**
+- `status=open&mve_filter=exclude` returned 147,085–147,642 markets, all
+  `active`, with zero MVEs leaking through. A full scan takes 3.5–7 minutes.
+- 94% of those markets have at least one resting order, and 16% traded in the
+  last 24 hours.
+- The `min_updated_ts` incremental query returns markets as they open, close,
+  pause and settle.
+- Unauthenticated WebSocket upgrades return `401`.
 
-**Suggested first live run:** `--max-markets 50`. Then check that the
-`seq_gaps`, `crossed_after_write`, `inconsistencies` and `command_errors`
-counters stay at 0, and read the file back. After that, run without the limit.
+**Authenticated WebSocket runs:**
+
+| Run | Markets / connections | Deltas | Gaps, crossed, invalid, command errors | REST cross-check |
+| - | - | - | - | - |
+| Smoke 1 & 2 | 50 / 1 | 1,209 and 972 | all 0 | 38 of 45 quiet markets match when fetched *after* stopping (timing) |
+| In-flight check | 50 / 1 | 1,736 | all 0 | **50 of 50** match |
+| Multi-socket | 3,000 / 6 × 500 | 124,982 | all 0 | **150 of 150** match |
+| Capacity | 2,000 / 2 × 1000 | 106,791 | all 0; 1 reconnect (see below) | 54 of 59 match; the 5 others lagged behind (see below) |
+
+- **REST cross-check method.** While the collector runs, a script fetches
+  Kalshi's public `GET /markets/{ticker}/orderbook` and records the local
+  request time. That endpoint reports No bids in No-leg prices. We then ask
+  whether the book rebuilt from our file (with `inspect --history-json`) held
+  *exactly* that book within ±3 s of the fetch. This independently confirms:
+  - delta → absolute-quantity conversion,
+  - the `use_yes_price` side mapping (our ask at P equals the REST No bid at 1 − P),
+  - that the SBE encoding round-trips.
+- **Things the docs left open, now settled:**
+  - `ok` replies are part of the `seq` sequence: zero false gaps across every
+    `add_markets`.
+  - `add_markets` delivers snapshots.
+  - 1,000 markets per subscription is accepted, with no error 26.
+  - Kalshi sends an unsolicited `orderbook_snapshot` when it cancels a book
+    en masse, for example an empty book when an NHL period market closes. The
+    collector treats every snapshot as authoritative, which is correct.
+- **SIGINT.** It closed every WebSocket (Close frame sent) and flushed a file
+  the template reader decodes, in every run.
+
+**Throughput findings (capacity run):**
+- At about 1,300 deltas/s during live NFL and NHL games, receive lag rose
+  steadily to around 60 s. Kalshi then reset that connection. The collector
+  reconnected, resubscribed and re-snapshotted, as designed.
+- **The collector was not the bottleneck:**
+  - socket `Recv-Q` was always 0,
+  - CPU was ≤ 26% of one core,
+  - the writer's queue backlog was about 0,
+  - receive − `sending_ts_ms` equalled receive − `ts_ms` (the
+    `max_send_lag_ms` / `max_change_lag_ms` gauges), so the delay was after
+    Kalshi queued each message, on the way to us.
+- **The host link measured 0.5–1.2 MB/s,** about the size of that stream.
+- **Timestamps stay honest under lag.** `received_at` / `backtest_timestamp`
+  are the actual arrival times, so the file records the lag rather than
+  hiding it.
+- **Compression is available.** Kalshi negotiates `permessage-deflate`, and
+  enabling it is the obvious next step (Extension 4). It needs a WebSocket
+  library other than tungstenite 0.30, which has no compression support.
+
+**Not yet run:** a full 147k-market collection. On paper it fits the limits:
+148 connections at 1,000 per connection, under the default cap of 190 and
+Kalshi's Basic limit of 200. But all of Kalshi's traffic is far more than this
+link carried. Run it from a host with real bandwidth, close to Kalshi
+(US-East), or after adding compression.
 
 ## Known limitations
 
@@ -293,8 +338,15 @@ counters stay at 0, and read the file back. After that, run without the limit.
   They're resubscribed, with a fresh snapshot, when they reopen.
 - **Disk usage.** The minute snapshots of ~150k books come to roughly
   50–100 MB a minute, plus deltas.
-- **Clock accuracy.** Timestamp accuracy depends on the host clock (NTP).
-  Kalshi's exchange times have millisecond resolution.
+- **Clock accuracy.** Local timestamps are only as good as the host clock.
+  On the test machine, Windows Time had never synced ("Local CMOS Clock"), and
+  WSL inherits that clock. NTP showed it about 684 ms behind, so most deltas
+  looked like they arrived before Kalshi sent them. The
+  `exchange_after_receive` counter flags this. Enable NTP before collecting:
+  run `w32tm /resync` as admin on Windows, or use chrony or systemd-timesyncd
+  on Linux. Kalshi's exchange times have millisecond resolution.
+- **Bandwidth.** Receive lag grows if the link can't carry the feed (see
+  above). Watch `max_send_lag_ms` in the stats line.
 - **Unbounded channel.** The channel from the connections to the writer has
   no limit, so a writer that falls behind uses memory rather than stalling the
   sockets. The backlog is logged.

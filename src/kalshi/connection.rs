@@ -521,6 +521,13 @@ impl Connection {
                 sending_ts_ms, msg, ..
             } => {
                 Metrics::inc(&self.metrics.deltas);
+                let now_ms = received_at.timestamp_millis();
+                if let Some(sent) = sending_ts_ms {
+                    Metrics::observe_max(&self.metrics.max_send_lag_ms, now_ms - sent);
+                }
+                if let Some(changed) = msg.ts_ms {
+                    Metrics::observe_max(&self.metrics.max_change_lag_ms, now_ms - changed);
+                }
                 let converted = protocol::delta_event(self.id, received_at, sending_ts_ms, msg)
                     .map_err(|e| SessionEnd::Failed(format!("bad delta: {e}")))?;
                 self.forward(converted)?;
